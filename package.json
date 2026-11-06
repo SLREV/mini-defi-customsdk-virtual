@@ -1,0 +1,42 @@
+{
+  "name": "mini-defi-launchpad-amm",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/verifySdk.ts && tsx tests/verifyPinata.ts && tsx tests/verifyPinataApi.ts && tsx tests/verifyClaimCreator.ts",
+    "anchor:build": "anchor build",
+    "anchor:deploy": "anchor deploy --provider.cluster devnet",
+    "devnet:check": "tsx scripts/devnetPreflight.ts",
+    "pinata:upload": "tsx scripts/pinataUpload.ts",
+    "pinata:check": "tsx scripts/pinataUpload.ts --check",
+    "claim:creator": "tsx scripts/claimCreatorFee.ts"
+  },
+  "dependencies": {
+    "@solana/buffer-layout": "^4.0.1",
+    "@solana/web3.js": "^1.98.0",
+    "buffer": "^6.0.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}
