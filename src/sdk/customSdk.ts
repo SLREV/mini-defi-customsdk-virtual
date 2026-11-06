@@ -45,7 +45,6 @@ export const DEVNET_USDC_MINT = new PublicKey(
 );
 
 export const DEFAULT_TOKEN_DECIMALS = 9;
-export const DEFAULT_VIRTUAL_SOL_LAMPORTS = 30_000_000_000n; // 30 SOL
 
 export const SPL_MINT_SIZE = 82;
 export const SPL_TOKEN_ACCOUNT_SIZE = 165;
@@ -61,19 +60,18 @@ export const TOKEN_2022_MINT_METADATA_POINTER_SIZE = 234;
  * bisa dipastikan browser benar-benar menjalankan kode terbaru (bukan bundle lama),
  * mis. setelah perbaikan layout `MintToChecked` (3 akun, bukan 4).
  */
-export const SDK_BUILD_TAG = '2026.11.06 · creatorFee=6bps · mintToChecked=3akun';
+export const SDK_BUILD_TAG = '2026.11.06 · leveraged10x · fee=30bps';
 
 /**
  * Ukuran akun `PoolState` di `programs/mini-amm/src/lib.rs`:
- * 8B discriminator + 8 * 32B Pubkeys (256B) + 2 * 8B u64 (16B) + 1B bump = 281 bytes
+ * 8B discriminator + 5 * 32B Pubkeys + 2 * 8B u64 + 1B bump = 185 bytes
  */
-export const POOL_STATE_SIZE = 281;
+export const POOL_STATE_SIZE = 185;
 
-/** Fee swap 0.30% (30 bps) dipecah: 0.24% LP (24 bps) + 0.06% creator (6 bps). */
-export const BPS_DENOMINATOR = 10_000n;
-export const TOTAL_FEE_BPS = 30n;
-export const CREATOR_FEE_BPS = 6n;
-export const LP_FEE_BPS = 24n;
+/** Biaya swap 0.30%; fee dipertahankan di pool. */
+export const FEE_NUMERATOR = 3n;
+export const FEE_DENOMINATOR = 1_000n;
+export const LEVERAGE_MULTIPLIER = 10n;
 
 /** sha256("account:PoolState")[0..8] */
 export const POOL_STATE_DISCRIMINATOR = Uint8Array.from([
@@ -97,7 +95,6 @@ export const AMM_IX_DISCRIMINATOR = {
   INITIALIZE_POOL: 0,
   ADD_LIQUIDITY: 1,
   SWAP: 2,
-  CLAIM_CREATOR_FEE: 3,
 } as const;
 
 const SPL_TOKEN_IX = {
@@ -112,7 +109,7 @@ const SPL_TOKEN_IX = {
 const METAPLEX_CREATE_METADATA_V3_IX = 33;
 
 // ============================================================================
-// CUSTOM @solana/buffer-layout PRIMITIVES (PUBKEY 32B & LOSSLESS U64/NU64 8B)
+// CUSTOM @solana/buffer-layout PRIMITIVES (PUBKEY 32B & LOSSLESS U64 8B)
 // ============================================================================
 
 export class PublicKeyLayout extends BufferLayout.Layout<PublicKey> {
@@ -184,17 +181,13 @@ export interface RawPoolStateLayoutData {
   vaultX: PublicKey;
   vaultY: PublicKey;
   lpMint: PublicKey;
-  creator: PublicKey;
-  feeVaultX: PublicKey;
-  feeVaultY: PublicKey;
   virtualReservesX: bigint;
   virtualReservesY: bigint;
   bump: number;
 }
 
 /**
- * Skema biner 281-byte yang cocok 1:1 dengan struct `PoolState` di
- * `programs/mini-amm/src/lib.rs` (termasuk `creator`, `fee_vault_x`, `fee_vault_y`).
+ * Skema biner 185-byte yang cocok 1:1 dengan struct `PoolState` di program Anchor.
  */
 export const PoolStateLayout = BufferLayout.struct<RawPoolStateLayoutData>([
   BufferLayout.blob(8, 'discriminator'),
@@ -203,9 +196,6 @@ export const PoolStateLayout = BufferLayout.struct<RawPoolStateLayoutData>([
   publicKeyLayout('vaultX'),
   publicKeyLayout('vaultY'),
   publicKeyLayout('lpMint'),
-  publicKeyLayout('creator'),
-  publicKeyLayout('feeVaultX'),
-  publicKeyLayout('feeVaultY'),
   u64Layout('virtualReservesX'),
   u64Layout('virtualReservesY'),
   BufferLayout.u8('bump'),
@@ -214,16 +204,16 @@ export const PoolStateLayout = BufferLayout.struct<RawPoolStateLayoutData>([
 export const POOL_STATE_LAYOUT = PoolStateLayout;
 
 /**
- * `initialize_pool` (disc=0): 1B discriminator + 8B initial_real_token_y + 8B virtual_reserves_x = 17B
+ * `initialize_pool` (disc=0): 1B discriminator + 8B initial_real_token_y + 8B real_sol_deposited = 17B
  */
 export const CREATE_POOL_IX_LAYOUT = BufferLayout.struct<{
   discriminator: number;
   initialRealTokenY: bigint;
-  virtualReservesX: bigint;
+  realSolDeposited: bigint;
 }>([
   BufferLayout.u8('discriminator'),
   u64Layout('initialRealTokenY'),
-  u64Layout('virtualReservesX'),
+  u64Layout('realSolDeposited'),
 ]);
 
 /**
@@ -256,28 +246,6 @@ export const SWAP_IX_LAYOUT = BufferLayout.struct<{
   BufferLayout.u8('xToY'),
 ]);
 
-/**
- * `claim_creator_fee` (disc=3): 1B discriminator + 1B side + 8B min_amount = 10B
- * `side`: 0 = kedua sisi, 1 = token X saja, 2 = token Y saja.
- */
-export const CLAIM_CREATOR_FEE_IX_LAYOUT = BufferLayout.struct<{
-  discriminator: number;
-  side: number;
-  minAmount: bigint;
-}>([
-  BufferLayout.u8('discriminator'),
-  BufferLayout.u8('side'),
-  u64Layout('minAmount'),
-]);
-
-/** Sisi claim fee creator. */
-export type ClaimSide = 'BOTH' | 'X' | 'Y';
-
-export const CLAIM_SIDE_BYTE: Record<ClaimSide, number> = {
-  BOTH: 0,
-  X: 1,
-  Y: 2,
-};
 
 /**
  * Token-2022 `MetadataPointerInstruction::Initialize` (66 bytes):
@@ -457,12 +425,6 @@ export interface DerivedPoolAddresses {
   vaultXBump: number;
   vaultY: PublicKey;
   vaultYBump: number;
-  /** Penampung fee creator sisi Token X (PDA, authority = pool_state) */
-  feeVaultX: PublicKey;
-  feeVaultXBump: number;
-  /** Penampung fee creator sisi Token Y (PDA, authority = pool_state) */
-  feeVaultY: PublicKey;
-  feeVaultYBump: number;
 }
 
 export interface CreatePoolParams {
@@ -473,8 +435,8 @@ export interface CreatePoolParams {
   tokenY: PublicKey;
   /** Pasokan Token Y fisik awal yang disetor ke `vault_y` (9 desimal) */
   initialRealTokenY: bigint | number;
-  /** Likuiditas bayangan SOL awal `virtual_reserves_x` (default: 30 SOL = `30_000_000_000n`) */
-  virtualReservesX?: bigint | number;
+  /** Deposit fisik Token X awal (lamports untuk WSOL); virtual reserve X ditetapkan 10x deposit ini. */
+  realSolDeposited: bigint | number;
   /** Program ID untuk Token X (default: `TOKEN_PROGRAM_ID` untuk WSOL) */
   tokenProgramX?: PublicKey;
   /** Program ID untuk Token Y (default: `TOKEN_2022_PROGRAM_ID`) */
@@ -489,6 +451,7 @@ export interface CreatePoolBuildResult {
   instruction: TransactionInstruction;
   serializedIxData: Buffer;
   addresses: DerivedPoolAddresses;
+  userTokenX: PublicKey;
   userTokenY: PublicKey;
   userLpToken: PublicKey;
   expectedInitialLp: bigint;
@@ -541,34 +504,6 @@ export interface SwapBuildResult {
   unwrapWsol: boolean;
 }
 
-export interface ClaimCreatorFeeParams {
-  /** Wallet pembuat pool (wajib signer; harus sama dengan `pool_state.creator`) */
-  creator: PublicKey;
-  /** Mint Token X (default: `NATIVE_SOL_MINT` / WSOL) */
-  tokenX?: PublicKey;
-  tokenY: PublicKey;
-  /** Sisi yang diklaim: `BOTH` (default), `X`, atau `Y` */
-  side?: ClaimSide;
-  /** Minimal fee yang harus terakumulasi per sisi (default `0n`) */
-  minAmount?: bigint | number;
-  tokenProgramX?: PublicKey;
-  tokenProgramY?: PublicKey;
-  /** Buat ATA creator bila belum ada (default `true`) */
-  createMissingAtas?: boolean;
-  recentBlockhash?: string;
-}
-
-export interface ClaimCreatorFeeBuildResult {
-  transaction: Transaction;
-  instruction: TransactionInstruction;
-  serializedIxData: Buffer;
-  addresses: DerivedPoolAddresses;
-  creatorTokenX: PublicKey;
-  creatorTokenY: PublicKey;
-  side: ClaimSide;
-  minAmount: bigint;
-}
-
 export interface DeserializedPoolInfo {
   poolAddress: PublicKey;
   discriminator: number[];
@@ -577,14 +512,6 @@ export interface DeserializedPoolInfo {
   vaultX: PublicKey;
   vaultY: PublicKey;
   lpMint: PublicKey;
-  /** Wallet pembuat pool — satu-satunya yang boleh mengklaim fee creator */
-  creator: PublicKey;
-  /** Penampung fee creator sisi Token X / Token Y */
-  feeVaultX: PublicKey;
-  feeVaultY: PublicKey;
-  /** Fee creator yang sudah terakumulasi dan siap diklaim */
-  creatorFeeX: bigint;
-  creatorFeeY: bigint;
   tokenProgramX: PublicKey;
   tokenProgramY: PublicKey;
   tokenProgramLp: PublicKey;
@@ -708,50 +635,18 @@ export function calculateInitialLpTokens(amountX: bigint, amountY: bigint): bigi
 /**
  * Constant Product (`x * y = k`) dengan fee 0.30% (997 / 1000) — identik dengan `src/lib.rs`.
  */
-/**
- * Fee creator = 6 bps (0.06%) dari `amountIn`, dipotong dari input sebelum masuk vault.
- * Paritas 1:1 dengan `calculate_creator_fee()` di `programs/mini-amm/src/lib.rs`.
- */
-export function calculateCreatorFee(amountIn: bigint): bigint {
-  if (amountIn <= 0n) {
-    return 0n;
-  }
-  return (amountIn * CREATOR_FEE_BPS) / BPS_DENOMINATOR;
-}
-
-/**
- * Output swap: fee creator (6 bps) dipotong lebih dulu, sisanya dikenai fee LP 24 bps.
- * Total beban swap tetap ~0.30% seperti sebelumnya (0.06% creator + 0.24% LP).
- */
 export function calculateSwapOutput(
   amountIn: bigint,
   reserveIn: bigint,
   reserveOut: bigint
 ): bigint {
-  if (amountIn <= 0n) {
-    throw new Error('Swap input amount must be strictly positive');
-  }
-  if (reserveIn <= 0n || reserveOut <= 0n) {
-    throw new Error('Pool reserves must be strictly positive');
-  }
-  const netIn = amountIn - calculateCreatorFee(amountIn);
-  if (netIn <= 0n) {
-    throw new Error('Swap input amount must be strictly positive');
-  }
-  const amountInWithFee = netIn * (BPS_DENOMINATOR - LP_FEE_BPS);
-  const numerator = amountInWithFee * reserveOut;
-  const denominator = reserveIn * BPS_DENOMINATOR + amountInWithFee;
-  const out = numerator / denominator;
-  // Paritas 1:1 dengan `calculate_swap_output` di `programs/mini-amm/src/lib.rs`
-  if (out <= 0n) {
-    throw new Error('Computed swap output amount is zero');
-  }
-  if (out >= reserveOut) {
-    throw new Error('Computed swap output exhausts the output reserve');
-  }
-  if (out > MAX_U64) {
-    throw new RangeError('Swap output exceeds u64 bounds');
-  }
+  if (amountIn <= 0n) throw new Error('Swap input amount must be strictly positive');
+  if (reserveIn <= 0n || reserveOut <= 0n) throw new Error('Pool reserves must be strictly positive');
+  const amountInAfterFee = amountIn * (FEE_DENOMINATOR - FEE_NUMERATOR);
+  const out = (amountInAfterFee * reserveOut) / (reserveIn * FEE_DENOMINATOR + amountInAfterFee);
+  if (out <= 0n) throw new Error('Computed swap output amount is zero');
+  if (out >= reserveOut) throw new Error('Computed swap output exhausts the output reserve');
+  if (out > MAX_U64) throw new RangeError('Swap output exceeds u64 bounds');
   return out;
 }
 
@@ -808,7 +703,7 @@ export function calculateToken2022MintTotalBytes(params: {
 }
 
 // ============================================================================
-// CUSTOM DEFI SDK CLASS (TOKEN-2022 + VIRTUAL LIQUIDITY AMM)
+// CUSTOM DEFI SDK CLASS (TOKEN INTERFACE + LEVERAGED VIRTUAL RESERVES)
 // ============================================================================
 
 export class CustomDefiSDK {
@@ -872,14 +767,6 @@ export class CustomDefiSDK {
       [Buffer.from('vault_y', 'utf8'), poolState.toBuffer()],
       this.programId
     );
-    const [feeVaultX, feeVaultXBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from('fee_vault_x', 'utf8'), poolState.toBuffer()],
-      this.programId
-    );
-    const [feeVaultY, feeVaultYBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from('fee_vault_y', 'utf8'), poolState.toBuffer()],
-      this.programId
-    );
 
     return {
       poolState,
@@ -890,10 +777,6 @@ export class CustomDefiSDK {
       vaultXBump,
       vaultY,
       vaultYBump,
-      feeVaultX,
-      feeVaultXBump,
-      feeVaultY,
-      feeVaultYBump,
     };
   }
 
@@ -1209,7 +1092,7 @@ export class CustomDefiSDK {
     const offchainMetadataJson: OffchainTokenMetadataJson = {
       name: cleanName,
       symbol: cleanSymbol,
-      description: `${cleanName} ($${cleanSymbol}) — Token-2022 Virtual Liquidity Launchpad`,
+      description: `${cleanName} ($${cleanSymbol}) — Token-2022 Leveraged Virtual-Reserve AMM Launchpad`,
       image: cleanImage,
       extensions: {
         ...(cleanTelegram ? { telegram: cleanTelegram } : {}),
@@ -1391,12 +1274,12 @@ export class CustomDefiSDK {
   }
 
   // --------------------------------------------------------------------------
-  // 2. CREATE VIRTUAL LIQUIDITY POOL (`buildCreatePoolTx`)
+  // 2. CREATE LEVERAGED VIRTUAL-RESERVE POOL (`buildCreatePoolTx`)
   // --------------------------------------------------------------------------
 
   /**
-   * Serialisasi `initialize_pool` (`u8` discriminator = 0 + `initialRealTokenY` + `virtualReservesX`)
-   * dan menyusun 15 `AccountMeta` lintas-program (`tokenProgramX`, `tokenProgramY`, `tokenProgramLp`).
+   * Serialisasi `initialize_pool` (`u8` discriminator = 0 + `initialRealTokenY` + `realSolDeposited`)
+   * dan menyusun 16 `AccountMeta` lintas-program (`tokenProgramX`, `tokenProgramY`, `tokenProgramLp`).
    *
    * Transaksi yang dihasilkan berisi 2 instruksi:
    * 1. `CreateIdempotent` ATA `userTokenY` — account ini WAJIB sudah ada karena
@@ -1411,15 +1294,12 @@ export class CustomDefiSDK {
     const tokenX = params.tokenX ?? NATIVE_SOL_MINT;
     const tokenY = params.tokenY;
     const initialRealTokenY = toU64BigInt(params.initialRealTokenY);
-    const virtualReservesX = toU64BigInt(
-      params.virtualReservesX ?? DEFAULT_VIRTUAL_SOL_LAMPORTS
-    );
-
-    if (initialRealTokenY <= 0n || virtualReservesX <= 0n) {
-      throw new Error(
-        'initialRealTokenY dan virtualReservesX harus lebih besar dari 0n'
-      );
+    const realSolDeposited = toU64BigInt(params.realSolDeposited);
+    if (initialRealTokenY <= 0n || realSolDeposited <= 0n) {
+      throw new Error('initialRealTokenY dan realSolDeposited harus lebih besar dari 0n');
     }
+    const virtualReservesX = realSolDeposited * LEVERAGE_MULTIPLIER;
+    if (virtualReservesX > MAX_U64) throw new RangeError('Virtual reserve X melebihi u64');
 
     const tokenProgramX =
       params.tokenProgramX ??
@@ -1428,6 +1308,7 @@ export class CustomDefiSDK {
     const tokenProgramLp = params.tokenProgramLp ?? TOKEN_2022_PROGRAM_ID;
 
     const addresses = this.derivePoolAddresses(tokenX, tokenY);
+    const userTokenX = this.deriveAssociatedTokenAddress(params.payer, tokenX, tokenProgramX);
     const userTokenY = this.deriveAssociatedTokenAddress(
       params.payer,
       tokenY,
@@ -1444,13 +1325,12 @@ export class CustomDefiSDK {
       {
         discriminator: AMM_IX_DISCRIMINATOR.INITIALIZE_POOL,
         initialRealTokenY,
-        virtualReservesX,
+        realSolDeposited,
       },
       serializedIxData
     );
 
-    // 17 AccountMeta persis sesuai `InitializePool<'info>` di `programs/mini-amm/src/lib.rs`
-    // (termasuk `fee_vault_x` & `fee_vault_y` untuk fee creator 0.06%)
+    // 16 AccountMeta persis sesuai `InitializePool<'info>`; includes both depositor token accounts.
     const keys: AccountMeta[] = [
       { pubkey: params.payer, isSigner: true, isWritable: true },
       { pubkey: tokenX, isSigner: false, isWritable: false },
@@ -1459,8 +1339,7 @@ export class CustomDefiSDK {
       { pubkey: addresses.lpMint, isSigner: false, isWritable: true },
       { pubkey: addresses.vaultX, isSigner: false, isWritable: true },
       { pubkey: addresses.vaultY, isSigner: false, isWritable: true },
-      { pubkey: addresses.feeVaultX, isSigner: false, isWritable: true },
-      { pubkey: addresses.feeVaultY, isSigner: false, isWritable: true },
+      { pubkey: userTokenX, isSigner: false, isWritable: true },
       { pubkey: userTokenY, isSigner: false, isWritable: true },
       { pubkey: userLpToken, isSigner: false, isWritable: true },
       { pubkey: tokenProgramX, isSigner: false, isWritable: false },
@@ -1477,17 +1356,15 @@ export class CustomDefiSDK {
       data: serializedIxData,
     });
 
-    const transaction = new Transaction().add(
-      // ATA token Y milik pembuat pool harus ada sebelum CPI `transfer_checked`.
-      this.buildCreateAssociatedTokenIdempotentInstruction(
-        params.payer,
-        userTokenY,
-        params.payer,
-        tokenY,
-        tokenProgramY
-      ),
-      instruction
+    const transaction = new Transaction();
+    transaction.add(
+      this.buildCreateAssociatedTokenIdempotentInstruction(params.payer, userTokenX, params.payer, tokenX, tokenProgramX),
+      this.buildCreateAssociatedTokenIdempotentInstruction(params.payer, userTokenY, params.payer, tokenY, tokenProgramY),
     );
+    if (tokenX.equals(NATIVE_SOL_MINT)) {
+      transaction.add(SystemProgram.transfer({ fromPubkey: params.payer, toPubkey: userTokenX, lamports: realSolDeposited }), this.buildSyncNativeInstruction(userTokenX, tokenProgramX));
+    }
+    transaction.add(instruction);
     transaction.feePayer = params.payer;
     transaction.recentBlockhash =
       params.recentBlockhash ??
@@ -1505,6 +1382,7 @@ export class CustomDefiSDK {
       instruction,
       serializedIxData,
       addresses,
+      userTokenX,
       userTokenY,
       userLpToken,
       expectedInitialLp,
@@ -1706,8 +1584,7 @@ export class CustomDefiSDK {
       serializedIxData
     );
 
-    // 12 AccountMeta sesuai `Swap<'info>` di `programs/mini-amm/src/lib.rs`
-    // (fee_vault_x & fee_vault_y menerima potongan fee creator 0.06%)
+    // 10 AccountMeta sesuai `Swap<'info>` di `programs/mini-amm/src/lib.rs`.
     const keys: AccountMeta[] = [
       { pubkey: params.user, isSigner: true, isWritable: true },
       { pubkey: tokenX, isSigner: false, isWritable: false },
@@ -1715,8 +1592,6 @@ export class CustomDefiSDK {
       { pubkey: addresses.poolState, isSigner: false, isWritable: false },
       { pubkey: addresses.vaultX, isSigner: false, isWritable: true },
       { pubkey: addresses.vaultY, isSigner: false, isWritable: true },
-      { pubkey: addresses.feeVaultX, isSigner: false, isWritable: true },
-      { pubkey: addresses.feeVaultY, isSigner: false, isWritable: true },
       { pubkey: userTokenX, isSigner: false, isWritable: true },
       { pubkey: userTokenY, isSigner: false, isWritable: true },
       { pubkey: tokenProgramX, isSigner: false, isWritable: false },
@@ -1768,118 +1643,12 @@ export class CustomDefiSDK {
   }
 
   // --------------------------------------------------------------------------
-  // 4b. CLAIM FEE CREATOR (`buildClaimCreatorFeeTx` — discriminator 3)
-  // --------------------------------------------------------------------------
-
-  /**
-   * Menyusun transaksi `claim_creator_fee` (disc `u8 = 3`, payload 10B:
-   * `[3, u8(side), u64_le(min_amount)]`) untuk menarik fee creator 0.06% yang
-   * terakumulasi di `fee_vault_x` / `fee_vault_y`.
-   *
-   * Urutan instruksi: `CreateIdempotent` ATA creator (X & Y bila `createMissingAtas`)
-   * lalu `claim_creator_fee` — ATA wajib ada karena program mentransfer ke sana.
-   */
-  public async buildClaimCreatorFeeTx(
-    params: ClaimCreatorFeeParams
-  ): Promise<ClaimCreatorFeeBuildResult> {
-    const tokenX = params.tokenX ?? NATIVE_SOL_MINT;
-    const tokenY = params.tokenY;
-    const side: ClaimSide = params.side ?? 'BOTH';
-    const minAmount = toU64BigInt(params.minAmount ?? 0n);
-    const createMissingAtas = params.createMissingAtas ?? true;
-
-    const tokenProgramX =
-      params.tokenProgramX ??
-      (tokenX.equals(NATIVE_SOL_MINT) ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID);
-    const tokenProgramY = params.tokenProgramY ?? TOKEN_2022_PROGRAM_ID;
-
-    const addresses = this.derivePoolAddresses(tokenX, tokenY);
-    const creatorTokenX = this.deriveAssociatedTokenAddress(
-      params.creator,
-      tokenX,
-      tokenProgramX
-    );
-    const creatorTokenY = this.deriveAssociatedTokenAddress(
-      params.creator,
-      tokenY,
-      tokenProgramY
-    );
-
-    const serializedIxData = Buffer.alloc(CLAIM_CREATOR_FEE_IX_LAYOUT.span);
-    CLAIM_CREATOR_FEE_IX_LAYOUT.encode(
-      {
-        discriminator: AMM_IX_DISCRIMINATOR.CLAIM_CREATOR_FEE,
-        side: CLAIM_SIDE_BYTE[side],
-        minAmount,
-      },
-      serializedIxData
-    );
-
-    // 10 AccountMeta sesuai `ClaimCreatorFee<'info>` di `programs/mini-amm/src/lib.rs`
-    const keys: AccountMeta[] = [
-      { pubkey: params.creator, isSigner: true, isWritable: true },
-      { pubkey: addresses.poolState, isSigner: false, isWritable: false },
-      { pubkey: tokenX, isSigner: false, isWritable: false },
-      { pubkey: tokenY, isSigner: false, isWritable: false },
-      { pubkey: addresses.feeVaultX, isSigner: false, isWritable: true },
-      { pubkey: addresses.feeVaultY, isSigner: false, isWritable: true },
-      { pubkey: creatorTokenX, isSigner: false, isWritable: true },
-      { pubkey: creatorTokenY, isSigner: false, isWritable: true },
-      { pubkey: tokenProgramX, isSigner: false, isWritable: false },
-      { pubkey: tokenProgramY, isSigner: false, isWritable: false },
-    ];
-
-    const instruction = new TransactionInstruction({
-      programId: this.programId,
-      keys,
-      data: serializedIxData,
-    });
-
-    const transaction = new Transaction();
-    if (createMissingAtas) {
-      transaction.add(
-        this.buildCreateAssociatedTokenIdempotentInstruction(
-          params.creator,
-          creatorTokenX,
-          params.creator,
-          tokenX,
-          tokenProgramX
-        ),
-        this.buildCreateAssociatedTokenIdempotentInstruction(
-          params.creator,
-          creatorTokenY,
-          params.creator,
-          tokenY,
-          tokenProgramY
-        )
-      );
-    }
-    transaction.add(instruction);
-
-    transaction.feePayer = params.creator;
-    transaction.recentBlockhash =
-      params.recentBlockhash ??
-      (await this.connection.getLatestBlockhash('confirmed')).blockhash;
-
-    return {
-      transaction,
-      instruction,
-      serializedIxData,
-      addresses,
-      creatorTokenX,
-      creatorTokenY,
-      side,
-      minAmount,
-    };
-  }
-
-  // --------------------------------------------------------------------------
   // 5. FETCH & DESERIALIZE POOL INFO (`fetchPoolInfo`)
   // --------------------------------------------------------------------------
 
   /**
-   * Mengambil buffer 281-byte `PoolState` serta membaca saldo vault fisik (`vault_x`, `vault_y`),
-   * `lp_mint`, dan dua fee vault creator (`fee_vault_x`, `fee_vault_y`)
+   * Mengambil buffer 185-byte `PoolState` serta membaca saldo vault fisik (`vault_x`, `vault_y`),
+   * `lp_mint`, dan
    * dan `lp_mint` (kompatibel penuh baik untuk akun SPL Legacy maupun akun ber-ekstensi Token-2022).
    */
   public async fetchPoolInfo(
@@ -1931,17 +1700,9 @@ export class CustomDefiSDK {
     let tokenProgramY = TOKEN_2022_PROGRAM_ID;
     let tokenProgramLp = TOKEN_2022_PROGRAM_ID;
 
-    const [vaultXAcc, vaultYAcc, lpMintAcc, feeVaultXAcc, feeVaultYAcc] =
-      await this.connection.getMultipleAccountsInfo(
-        [
-          decoded.vaultX,
-          decoded.vaultY,
-          decoded.lpMint,
-          decoded.feeVaultX,
-          decoded.feeVaultY,
-        ],
-        'confirmed'
-      );
+    const [vaultXAcc, vaultYAcc, lpMintAcc] = await this.connection.getMultipleAccountsInfo(
+      [decoded.vaultX, decoded.vaultY, decoded.lpMint], 'confirmed'
+    );
 
     // Header 165B TokenAccount & 82B Mint sama persis pada SPL Legacy maupun Token-2022!
     if (vaultXAcc && vaultXAcc.data.byteLength >= SPL_TOKEN_ACCOUNT_SIZE) {
@@ -1963,19 +1724,6 @@ export class CustomDefiSDK {
       tokenProgramLp = lpMintAcc.owner;
     }
 
-    let creatorFeeX = 0n;
-    let creatorFeeY = 0n;
-    if (feeVaultXAcc && feeVaultXAcc.data.byteLength >= SPL_TOKEN_ACCOUNT_SIZE) {
-      creatorFeeX = SPL_TOKEN_ACCOUNT_LAYOUT.decode(
-        feeVaultXAcc.data.subarray(0, SPL_TOKEN_ACCOUNT_SIZE)
-      ).amount;
-    }
-    if (feeVaultYAcc && feeVaultYAcc.data.byteLength >= SPL_TOKEN_ACCOUNT_SIZE) {
-      creatorFeeY = SPL_TOKEN_ACCOUNT_LAYOUT.decode(
-        feeVaultYAcc.data.subarray(0, SPL_TOKEN_ACCOUNT_SIZE)
-      ).amount;
-    }
-
     const totalReservesX = realReservesX + decoded.virtualReservesX;
     const totalReservesY = realReservesY + decoded.virtualReservesY;
     const kEffectiveInvariant = totalReservesX * totalReservesY;
@@ -1994,11 +1742,6 @@ export class CustomDefiSDK {
       vaultX: decoded.vaultX,
       vaultY: decoded.vaultY,
       lpMint: decoded.lpMint,
-      creator: decoded.creator,
-      feeVaultX: decoded.feeVaultX,
-      feeVaultY: decoded.feeVaultY,
-      creatorFeeX,
-      creatorFeeY,
       tokenProgramX,
       tokenProgramY,
       tokenProgramLp,
