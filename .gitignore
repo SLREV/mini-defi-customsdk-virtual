@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.*
+!.env.example
+.anchor/
+target/
+.DS_Store
